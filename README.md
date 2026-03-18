@@ -1,6 +1,6 @@
 # Lyric Engine
 
-A phonetic-aware lyrics generation system built on top of large language models. Unlike generic text generators, Lyric Engine treats lyrics as *music* — with stress patterns, rhyme density, and emotional arc baked into the generation process itself.
+A phonetic-aware lyrics generation system built on top of large language models. Unlike generic text generators, Lyric Engine treats lyrics as *music* - with stress patterns, rhyme density, and emotional arc baked into the generation process itself.
 
 ## What makes it different
 
@@ -33,17 +33,17 @@ Output: 8 lines where every end-rhyme is phonetically verified,
 └─────────────────────────────────────────────────────┘
 ```
 
-**Dual tokenizer** — every input is tokenized twice in parallel:
+**Dual tokenizer** - every input is tokenized twice in parallel:
 - Semantic stream: standard BPE tokens (meaning)
 - Phoneme stream: CMU Pronouncing Dictionary ARPAbet tokens (sound)
 
-**Genre LoRA adapters** — one lightweight adapter (~4M params) per genre, merged at inference with weighted blending. Blend two genres: `60% trap + 40% R&B` = interpolated adapter weights, single forward pass.
+**Genre LoRA adapters** - one lightweight adapter (~4M params) per genre, merged at inference with weighted blending. Blend two genres: `60% trap + 40% R&B` = interpolated adapter weights, single forward pass.
 
-**Artist style encoder** — 128-dim vector capturing an artist's statistical fingerprint: average syllables per line, rhyme density, unique vocabulary ratio, metaphor cluster centroid (via sentence-transformers), emotional valence distribution. Injected as a prefix token into the embedding space. No verbatim lyric memorization — legally safe.
+**Artist style encoder** - 128-dim vector capturing an artist's statistical fingerprint: average syllables per line, rhyme density, unique vocabulary ratio, metaphor cluster centroid (via sentence-transformers), emotional valence distribution. Injected as a prefix token into the embedding space. No verbatim lyric memorization - legally safe.
 
-**Emotional arc modeling** — songs are tagged with section-level arc tokens `[SETUP] → [BUILD] → [RELEASE] → [REFRAME] → [PEAK]`. Valence and arousal are scored per line (TextBlob / fine-tuned RoBERTa). The arc is enforced as a constraint during beam scoring, not just a prompt instruction.
+**Emotional arc modeling** - songs are tagged with section-level arc tokens `[SETUP] → [BUILD] → [RELEASE] → [REFRAME] → [PEAK]`. Valence and arousal are scored per line (TextBlob / fine-tuned RoBERTa). The arc is enforced as a constraint during beam scoring, not just a prompt instruction.
 
-**Constrained beam search** — generates 8 candidate lines, scores each on:
+**Constrained beam search** - generates 8 candidate lines, scores each on:
 1. Phonetic rhyme match (end-phoneme edit distance)
 2. Syllable count match (hard filter ±3)
 3. Novelty vs accepted lines (Jaccard distance)
@@ -164,8 +164,8 @@ HUGGING_FACE_HUB_TOKEN= # Required to download Llama 3.1
 
 ## Key technical decisions
 
-**Why not just prompt GPT-4?** Prompting can't enforce phonetic constraints at the token level. You can ask GPT-4 to rhyme — it often doesn't, and when it does it's because it got lucky with its training data. This system *cannot* emit a line that violates the rhyme scheme because constraint checking happens before a token is accepted.
+**Why not just prompt GPT-4?** Prompting can't enforce phonetic constraints at the token level. You can ask GPT-4 to rhyme - it often doesn't, and when it does it's because it got lucky with its training data. This system *cannot* emit a line that violates the rhyme scheme because constraint checking happens before a token is accepted.
 
 **Why LoRA per genre instead of one big model?** Storage efficiency (~32MB per adapter vs retraining 8B params), composability (blend adapters at runtime), and the ability to add new genres without touching the base model.
 
-**Why style vectors instead of fine-tuning on artist lyrics?** Copyright. A style vector is a statistical fingerprint — it captures *how* someone writes, not *what* they wrote. The generated output is original and legally defensible.
+**Why style vectors instead of fine-tuning on artist lyrics?** Copyright. A style vector is a statistical fingerprint - it captures *how* someone writes, not *what* they wrote. The generated output is original and legally defensible.
