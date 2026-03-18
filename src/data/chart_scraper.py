@@ -2,9 +2,10 @@
 Global chart scraper — 55 countries x Top 100 = 5,500 songs/week.
 
 NO API KEY NEEDED — uses free public sources:
-  1. charts.spotify.com  (public CSV download, no login)
-  2. Last.fm API         (free, no premium — get key at last.fm/api)
-  3. iTunes RSS          (100% free, no key needed)
+  1. Billboard charts    (no key needed — hot-100, global 200, + genre charts)
+  2. charts.spotify.com  (public CSV download, no login)
+  3. Last.fm API         (free, no premium — get key at last.fm/api)
+  4. iTunes RSS          (100% free, no key needed)
 
 Output: data/charts/YYYY-WW.jsonl
 """
@@ -109,7 +110,85 @@ ITUNES_COUNTRY_MAP = {
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-# ── Source 1: Spotify Charts public CSV (no API key) ─────────────────────────
+# ── Source 1: Billboard (no API key needed) ───────────────────────────────────
+
+# Billboard charts we pull — covers every major genre globally
+BILLBOARD_CHARTS = [
+    ("hot-100",                   "US",     "Americas", "pop/hip_hop/rnb"),
+    ("billboard-global-200",      "GLOBAL", "Global",   "global"),
+    ("billboard-global-excl-us",  "GLOBAL", "Global",   "global_excl_us"),
+    ("rap-song",                  "US",     "Americas", "hip_hop/rap"),
+    ("hot-rnb-hip-hop-songs",     "US",     "Americas", "rnb/hip_hop"),
+    ("hot-country-songs",         "US",     "Americas", "country"),
+    ("hot-rock-songs",            "US",     "Americas", "rock"),
+    ("hot-latin-songs",           "LATIN",  "Latin America", "latin"),
+    ("tropical-songs",            "LATIN",  "Latin America", "tropical"),
+    ("reggaeton-songs",           "LATIN",  "Latin America", "reggaeton"),
+    ("k-pop",                     "KR",     "Asia",     "kpop"),
+    ("afrobeats",                 "AFRICA", "Africa",   "afrobeats"),
+    ("dance-electronic-songs",    "US",     "Global",   "edm"),
+    ("pop-songs",                 "US",     "Americas", "pop"),
+    ("adult-contemporary",        "US",     "Americas", "pop"),
+    ("uk-songs",                  "GB",     "Europe",   "uk"),
+    ("france-songs",              "FR",     "Europe",   "french"),
+    ("germany-songs",             "DE",     "Europe",   "german"),
+    ("italy-songs",               "IT",     "Europe",   "italian"),
+    ("spain-songs",               "ES",     "Europe",   "spanish"),
+    ("brazil-songs",              "BR",     "Latin America", "brazilian"),
+    ("mexico-songs",              "MX",     "Latin America", "mexican"),
+    ("colombia-songs",            "CO",     "Latin America", "colombian"),
+    ("argentina-songs",           "AR",     "Latin America", "argentinian"),
+    ("japan-songs",               "JP",     "Asia",     "jpop"),
+    ("philippines-songs",         "PH",     "Asia",     "opm"),
+    ("india-songs",               "IN",     "Asia",     "indian"),
+]
+
+def fetch_billboard_all() -> list[dict]:
+    """
+    Fetch all Billboard charts — no API key, no login.
+    Returns combined list of records tagged by country/region/genre.
+    """
+    try:
+        import billboard
+    except ImportError:
+        print("  billboard.py not installed — run: pip install billboard.py")
+        return []
+
+    now = datetime.datetime.utcnow().isoformat()
+    week = datetime.datetime.utcnow().strftime("%Y-%W")
+    all_records = []
+
+    for chart_name, country, region, genre_tag in BILLBOARD_CHARTS:
+        try:
+            chart = billboard.ChartData(chart_name)
+            country_name = COUNTRIES.get(country, (country, region))[0] if country in COUNTRIES else country
+            for entry in chart[:100]:
+                all_records.append({
+                    "rank":           entry.rank,
+                    "title":          entry.title,
+                    "artist":         entry.artist,
+                    "track_id":       f"billboard:{chart_name}:{entry.rank}",
+                    "streams":        0,
+                    "peak_rank":      entry.peakPos or entry.rank,
+                    "weeks_on_chart": entry.weeks or 1,
+                    "country":        country,
+                    "country_name":   country_name,
+                    "region":         region,
+                    "genre_tag":      genre_tag,
+                    "chart_name":     chart_name,
+                    "week":           week,
+                    "scraped_at":     now,
+                    "source":         "billboard",
+                })
+            print(f"  Billboard [{chart_name}]: {len(chart[:100])} songs")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"  Billboard [{chart_name}] error: {e}")
+
+    return all_records
+
+
+# ── Source 2: Spotify Charts public CSV (no API key) ─────────────────────────
 
 def fetch_spotify_charts_csv(country_code: str) -> list[dict]:
     """
@@ -314,6 +393,15 @@ def scrape_all_charts(out_dir: str = "data/charts") -> list[dict]:
         print("TIP: Set LASTFM_API_KEY in .env for better coverage (free at last.fm/api)")
 
     all_records = []
+
+    # ── Billboard first (covers 25+ genre charts globally) ────────────────────
+    print("\n=== Billboard Charts ===")
+    billboard_records = fetch_billboard_all()
+    all_records.extend(billboard_records)
+    print(f"Billboard total: {len(billboard_records)} entries across {len(BILLBOARD_CHARTS)} charts")
+
+    # ── Per-country scrape ─────────────────────────────────────────────────────
+    print("\n=== Country Charts (Spotify CSV + Last.fm + iTunes) ===")
     total = len(COUNTRIES)
 
     for i, (code, (name, region)) in enumerate(COUNTRIES.items(), 1):
@@ -398,7 +486,7 @@ def compute_viral_scores(records: list[dict]) -> list[dict]:
 def run_weekly():
     import signal
     print(f"Global Chart Scraper — {len(COUNTRIES)} countries x Top 100")
-    print("Sources: Spotify Charts CSV + Last.fm + iTunes (all free)")
+    print("Sources: Billboard + Spotify Charts CSV + Last.fm + iTunes (all free)")
     print("=" * 60)
 
     running = True
