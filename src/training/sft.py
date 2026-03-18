@@ -34,7 +34,7 @@ def train_sft(
     output_dir: str = "checkpoints",
     batch_size: int = 4,
     grad_accum_steps: int = 8,
-    max_length: int = 1024,
+    max_length: int = 512,
     epochs: int = 2,
     lr: float = 2e-4,
     lora_rank: int = 64,
@@ -58,6 +58,7 @@ def train_sft(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     base, tokenizer = load_base_model(base_model, use_4bit=use_4bit and device == "cuda")
     base = apply_lora(base, rank=lora_rank)
+    base.gradient_checkpointing_enable()
     model = LyricsModel(base, d_model=base.config.hidden_size)
 
     if accelerator.is_main_process:
