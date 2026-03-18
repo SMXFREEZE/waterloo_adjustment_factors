@@ -3,9 +3,10 @@ Global chart scraper — 55 countries x Top 100 = 5,500 songs/week.
 
 NO API KEY NEEDED — uses free public sources:
   1. Billboard charts    (no key needed — hot-100, global 200, + genre charts)
-  2. charts.spotify.com  (public CSV download, no login)
-  3. Last.fm API         (free, no premium — get key at last.fm/api)
-  4. iTunes RSS          (100% free, no key needed)
+  2. Deezer API          (free, no auth — dominates Africa/Morocco/France/LatAm)
+  3. charts.spotify.com  (public CSV download, no login)
+  4. Last.fm API         (free, no premium — get key at last.fm/api)
+  5. iTunes RSS          (100% free, no key needed)
 
 Output: data/charts/YYYY-WW.jsonl
 """
@@ -316,7 +317,60 @@ def fetch_itunes_charts(country_code: str) -> list[dict]:
         return []
 
 
-# ── Source 4: Last.fm global top tracks (fallback for any country) ────────────
+# ── Source 4: Deezer API (free, no auth, strong in Africa/France/LatAm) ──────
+
+# Deezer country IDs — strongest where Spotify is weak (Morocco, Africa, France)
+DEEZER_COUNTRY_IDS = {
+    "FR": 23,   "MA": 216,  "DZ": 6,    "TN": 216,  "SN": 216,
+    "CI": 216,  "CM": 216,  "ML": 216,  "BF": 216,
+    "BR": 18,   "MX": 152,  "CO": 49,   "AR": 11,   "CL": 46,
+    "PE": 174,  "VE": 236,  "EC": 63,   "DO": 61,
+    "BE": 16,   "CH": 226,  "DE": 74,   "ES": 67,   "IT": 107,
+    "PT": 178,  "NL": 159,  "PL": 178,  "RO": 185,
+    "NG": 166,  "ZA": 205,  "KE": 119,  "GH": 81,   "EG": 64,
+    "TR": 229,  "SA": 194,  "AE": 231,  "LB": 130,
+    "PH": 175,  "ID": 100,  "MY": 145,  "TH": 222,  "VN": 238,
+    "US": 232,  "GB": 78,   "CA": 37,   "AU": 13,
+}
+
+def fetch_deezer_charts(country_code: str) -> list[dict]:
+    """
+    Fetch top tracks from Deezer API — completely free, no API key, no auth.
+    Especially good for Morocco, francophone Africa, France, LatAm.
+    API: https://api.deezer.com/chart/{country_id}/tracks
+    """
+    country_id = DEEZER_COUNTRY_IDS.get(country_code)
+    if not country_id:
+        return []
+    try:
+        r = requests.get(
+            f"https://api.deezer.com/chart/{country_id}/tracks",
+            params={"limit": 100},
+            headers=HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        tracks = r.json().get("data", [])
+        results = []
+        for i, t in enumerate(tracks[:100]):
+            results.append({
+                "rank":           i + 1,
+                "title":          t.get("title", ""),
+                "artist":         t.get("artist", {}).get("name", ""),
+                "track_id":       f"deezer:{t.get('id','')}",
+                "streams":        t.get("rank", 0),
+                "peak_rank":      i + 1,
+                "weeks_on_chart": 1,
+                "duration_ms":    t.get("duration", 0) * 1000,
+                "source":         "deezer",
+            })
+        return results
+    except Exception:
+        return []
+
+
+# ── Source 5: Last.fm global top tracks (fallback for any country) ────────────
 
 def fetch_lastfm_global() -> list[dict]:
     """Fetch global top 100 from Last.fm — works without country."""
@@ -356,22 +410,29 @@ def fetch_lastfm_global() -> list[dict]:
 
 def fetch_chart(country_code: str) -> list[dict]:
     """
-    Try sources in order: Spotify CSV → Last.fm → iTunes → skip
+    Try sources in order: Deezer → Spotify CSV → Last.fm → iTunes → skip
     Returns the first source that gives data.
+    Deezer first for Africa/Morocco/France/LatAm where it dominates.
     """
-    # 1. Spotify Charts CSV
+    # 1. Deezer (free, no auth — best for niche markets)
+    entries = fetch_deezer_charts(country_code)
+    if entries:
+        return entries
+    time.sleep(0.3)
+
+    # 2. Spotify Charts CSV
     if country_code in SPOTIFY_CHART_COUNTRIES:
         entries = fetch_spotify_charts_csv(country_code)
         if entries:
             return entries
         time.sleep(0.3)
 
-    # 2. Last.fm by country
+    # 3. Last.fm by country
     entries = fetch_lastfm_charts(country_code)
     if entries:
         return entries
 
-    # 3. iTunes RSS
+    # 4. iTunes RSS
     entries = fetch_itunes_charts(country_code)
     if entries:
         return entries
@@ -437,23 +498,38 @@ def scrape_all_charts(out_dir: str = "data/charts") -> list[dict]:
 # ── Viral scores ───────────────────────────────────────────────────────────────
 
 def compute_viral_scores(records: list[dict]) -> list[dict]:
-    song_stats: dict[str, dict] = defaultdict(lambda: {
-        "countries": [], "ranks": [], "streams": 0, "title": "", "artist": ""
-    })
+    # key → {countries: list, ranks: list, streams: int, title: str, artist: str}
+    song_stats: dict[str, dict[str, list | int | str]] = {}
 
     for r in records:
         key = r["title"].lower().strip() + "::" + r["artist"].lower().strip()
-        song_stats[key]["countries"].append(r["country"])
-        song_stats[key]["ranks"].append(r["rank"])
-        song_stats[key]["streams"] += r.get("streams", 0)
+        if key not in song_stats:
+            song_stats[key] = {
+                "countries": [],
+                "ranks":     [],
+                "streams":   0,
+                "title":     r["title"],
+                "artist":    r["artist"],
+            }
+        countries = song_stats[key]["countries"]
+        ranks     = song_stats[key]["ranks"]
+        if isinstance(countries, list):
+            countries.append(r["country"])
+        if isinstance(ranks, list):
+            ranks.append(r["rank"])
+        streams = song_stats[key]["streams"]
+        song_stats[key]["streams"] = (streams if isinstance(streams, int) else 0) + r.get("streams", 0)
         song_stats[key]["title"]   = r["title"]
         song_stats[key]["artist"]  = r["artist"]
 
     scored = []
     for key, stats in song_stats.items():
-        n_countries = len(set(stats["countries"]))
-        avg_rank    = sum(stats["ranks"]) / len(stats["ranks"])
-        rank_score  = max(0, (101 - avg_rank) / 100)
+        countries_list = stats["countries"] if isinstance(stats["countries"], list) else []
+        ranks_list     = stats["ranks"]     if isinstance(stats["ranks"],     list) else []
+        streams_val    = stats["streams"]   if isinstance(stats["streams"],   int)  else 0
+        n_countries = len(set(countries_list))
+        avg_rank    = sum(ranks_list) / max(len(ranks_list), 1)
+        rank_score  = max(0.0, (101 - avg_rank) / 100)
         viral_score = round(n_countries * rank_score, 3)
         scored.append({
             "key":           key,
@@ -461,9 +537,9 @@ def compute_viral_scores(records: list[dict]) -> list[dict]:
             "artist":        stats["artist"],
             "n_countries":   n_countries,
             "avg_rank":      round(avg_rank, 1),
-            "total_streams": stats["streams"],
+            "total_streams": streams_val,
             "viral_score":   viral_score,
-            "countries":     sorted(set(stats["countries"])),
+            "countries":     sorted(set(countries_list)),
         })
 
     scored.sort(key=lambda x: x["viral_score"], reverse=True)
