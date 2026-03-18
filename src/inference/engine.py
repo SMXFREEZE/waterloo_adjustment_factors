@@ -26,6 +26,11 @@ from src.data.phoneme_annotator import annotate_line, LineAnnotation
 from src.data.rhyme_labeler import rhymes
 from src.data.valence_scorer import score_line, LineEmotion
 from src.model.dual_tokenizer import PHONEME_TO_ID, word_to_phoneme_ids
+from src.model.emotional_geometry import trajectory_fit_score, compute_song_arc
+from src.model.phonosemantic import texture_alignment_score
+from src.model.dopamine_arc import (
+    goosebump_potential, hook_dna_score, TensionCurve, analyze_song_dopamine,
+)
 
 
 # ── Syllable counter (deterministic, no LLM) ─────────────────────────────────
@@ -39,18 +44,28 @@ def count_syllables(line: str) -> int:
 @dataclass
 class SongMemory:
     genre: str
+    mood: str = "dark"                      # dark / hype / romantic / chill / sad / epic
     style_vec: Optional[np.ndarray] = None  # (128,)
     sections: list[tuple[str, str]] = field(default_factory=list)  # (arc_token, section_name)
     accepted_lines: list[str] = field(default_factory=list)
     rhyme_scheme: str = "AABB"              # AABB / ABAB / ABCB / free
     target_syllables: int = 10             # target per line
     used_end_phonemes: list[str] = field(default_factory=list)  # to avoid repetition
+    tension_curve: TensionCurve = field(default_factory=TensionCurve)
+    sections_lines: dict = field(default_factory=dict)  # track lines per section
 
-    def add_line(self, line: str):
+    def add_line(self, line: str, section: str = "verse1"):
         self.accepted_lines.append(line)
         ann = annotate_line(line)
         if ann.end_phoneme:
             self.used_end_phonemes.append(ann.end_phoneme)
+        # Track in tension curve
+        target_ep = self.get_target_end_phoneme()
+        self.tension_curve.update(line, target_ep)
+        # Track per-section
+        if section not in self.sections_lines:
+            self.sections_lines[section] = []
+        self.sections_lines[section].append(line)
 
     def get_target_end_phoneme(self) -> Optional[str]:
         """
@@ -92,12 +107,16 @@ class SongMemory:
 
 @dataclass
 class CandidateScore:
-    text: str
-    phonetic_score: float    # 0-1, higher = better rhyme match
-    syllable_ok: bool        # meets target syllable count ±3
-    novelty_score: float     # 0-1, higher = more novel
-    valence_fit: float       # 0-1, higher = fits emotional arc
-    total_score: float
+    text:               str
+    phonetic_score:     float   # 0-1  rhyme match
+    syllable_ok:        bool    # within ±3 syllables of target
+    novelty_score:      float   # 0-1  not repetitive
+    valence_fit:        float   # 0-1  emotional arc fit (simple)
+    trajectory_fit:     float   # 0-1  8D emotional geometry fit    ← NEW
+    texture_alignment:  float   # 0-1  phonosemantic texture match  ← NEW
+    goosebump:          float   # 0-1  predicted dopamine potential  ← NEW
+    hook_dna:           float   # 0-1  universal hook pattern score  ← NEW
+    total_score:        float
 
 
 def score_candidate(
@@ -105,29 +124,29 @@ def score_candidate(
     memory: SongMemory,
     target_arc_valence: float = 0.0,
     target_arc_arousal: float = 0.5,
+    section: str = "verse1",
+    mood: str = "dark",
+    tension_state: float = 0.3,
 ) -> CandidateScore:
     ann = annotate_line(line)
 
     # 1. Phonetic (rhyme) score
     target_ep = memory.get_target_end_phoneme()
     if target_ep is None:
-        phonetic_score = 1.0  # free verse — always fine
+        phonetic_score = 1.0
     elif ann.end_phoneme and rhymes(ann.end_phoneme, target_ep):
         phonetic_score = 1.0
     else:
         phonetic_score = 0.0
 
     # 2. Syllable check
-    syl_diff = abs(ann.total_syllables - memory.target_syllables)
-    syllable_ok = syl_diff <= 3
+    syllable_ok = abs(ann.total_syllables - memory.target_syllables) <= 3
 
-    # 3. Novelty: penalize if very similar to existing lines
+    # 3. Novelty
     def simple_overlap(a: str, b: str) -> float:
-        a_words = set(a.lower().split())
-        b_words = set(b.lower().split())
-        if not a_words or not b_words:
-            return 0.0
-        return len(a_words & b_words) / len(a_words | b_words)
+        aw = set(a.lower().split())
+        bw = set(b.lower().split())
+        return len(aw & bw) / len(aw | bw) if (aw and bw) else 0.0
 
     max_overlap = max(
         (simple_overlap(line, prev) for prev in memory.accepted_lines),
@@ -135,18 +154,46 @@ def score_candidate(
     )
     novelty_score = 1.0 - max_overlap
 
-    # 4. Valence fit
+    # 4. Simple valence fit (legacy, low weight)
     emotion = score_line(line)
     val_diff = abs(emotion.valence - target_arc_valence)
     aro_diff = abs(emotion.arousal - target_arc_arousal)
     valence_fit = 1.0 - (val_diff + aro_diff) / 4.0
 
-    # Weighted total
+    # 5. 8D Emotional geometry trajectory fit
+    try:
+        traj_fit = trajectory_fit_score(line, memory.genre, section)
+    except Exception:
+        traj_fit = valence_fit  # graceful fallback
+
+    # 6. Phonosemantic texture alignment
+    try:
+        tex_align = texture_alignment_score(line, mood, section)
+    except Exception:
+        tex_align = 0.5
+
+    # 7. Dopamine / goosebump potential
+    prev_line = memory.accepted_lines[-1] if memory.accepted_lines else None
+    try:
+        gbump = goosebump_potential(line, tension_state, prev_line, mood)
+    except Exception:
+        gbump = 0.0
+
+    # 8. Hook DNA
+    try:
+        hook = hook_dna_score(line, prev_line)
+    except Exception:
+        hook = 0.0
+
+    # Weighted total — the Cognitive Music score
     total = (
-        0.35 * phonetic_score
-        + 0.25 * (1.0 if syllable_ok else 0.0)
-        + 0.20 * novelty_score
-        + 0.20 * valence_fit
+        0.22 * phonetic_score
+        + 0.15 * (1.0 if syllable_ok else 0.0)
+        + 0.13 * novelty_score
+        + 0.18 * traj_fit       # emotional geometry
+        + 0.12 * tex_align      # phonosemantic
+        + 0.12 * gbump          # goosebump predictor
+        + 0.08 * hook           # hook DNA
     )
 
     return CandidateScore(
@@ -155,6 +202,10 @@ def score_candidate(
         syllable_ok=syllable_ok,
         novelty_score=novelty_score,
         valence_fit=valence_fit,
+        trajectory_fit=traj_fit,
+        texture_alignment=tex_align,
+        goosebump=gbump,
+        hook_dna=hook,
         total_score=total,
     )
 
@@ -223,20 +274,26 @@ class LyricsEngine:
         target_arc_valence: float = 0.0,
         target_arc_arousal: float = 0.5,
         top_n: int = 1,
+        section: str = "verse1",
     ) -> list[CandidateScore]:
         """
-        Generate and rank candidates. Returns top_n scored candidates.
+        Generate and rank candidates using the full Cognitive Music scoring.
         top_n=1 → auto mode, top_n=3 → co-write mode.
         """
         prompt = memory.build_prompt()
         candidates = self.generate_candidates(prompt)
 
         scored = [
-            score_candidate(c, memory, target_arc_valence, target_arc_arousal)
+            score_candidate(
+                c, memory,
+                target_arc_valence, target_arc_arousal,
+                section=section,
+                mood=memory.mood,
+                tension_state=memory.tension_curve.current,
+            )
             for c in candidates
         ]
 
-        # Hard filter: syllable OK preferred, then sort by total score
         ok = [s for s in scored if s.syllable_ok]
         ranked = sorted(ok or scored, key=lambda s: s.total_score, reverse=True)
         return ranked[:top_n]
@@ -265,16 +322,66 @@ class LyricsEngine:
         }
         target_val, target_aro = arc_valence_map.get(arc_token, (0.0, 0.5))
 
+        memory.tension_curve.reset_for_section(section)
+        memory.sections_lines[section] = []
+
         generated_lines = []
         for _ in range(num_lines):
-            top = self.generate_line(memory, target_val, target_aro, top_n=1)
+            top = self.generate_line(memory, target_val, target_aro, top_n=1, section=section)
             if top:
                 best = top[0]
                 if auto_accept:
-                    memory.add_line(best.text)
+                    memory.add_line(best.text, section=section)
                 generated_lines.append(best.text)
 
         return generated_lines
+
+    def analyze_song(self, memory: SongMemory) -> dict:
+        """
+        Full cognitive analysis of a generated song.
+        Shows artists:
+          - The 8D emotional arc across all sections
+          - The tension-release curve
+          - Every line's goosebump potential score
+          - Hook DNA patterns detected
+          - The single strongest moment in the whole song
+          - Phonosemantic texture per section
+
+        This is what no other AI music tool provides.
+        """
+        sections = {
+            sec: lines
+            for sec, lines in memory.sections_lines.items()
+            if lines
+        }
+        if not sections:
+            # Fallback: build from accepted lines
+            sections = {"verse1": memory.accepted_lines}
+
+        emotional_arc  = compute_song_arc(sections, memory.genre)
+        dopamine_arc   = analyze_song_dopamine(sections, memory.mood)
+
+        # Texture summary per section
+        texture_summary = {}
+        for sec, lines in sections.items():
+            try:
+                from src.model.phonosemantic import analyze_line_texture
+                profiles = [analyze_line_texture(l) for l in lines]
+                avg = np.mean([p.to_array() for p in profiles], axis=0)
+                from src.model.phonosemantic import TextureProfile
+                avg_profile = TextureProfile.from_array(avg)
+                texture_summary[sec] = avg_profile.describe()
+            except Exception:
+                texture_summary[sec] = "n/a"
+
+        return {
+            "emotional_arc":  emotional_arc,
+            "dopamine_arc":   dopamine_arc,
+            "texture_summary": texture_summary,
+            "peak_moment": dopamine_arc.get("peak_moment", {}),
+            "genre": memory.genre,
+            "mood":  memory.mood,
+        }
 
 
 # ── Co-write session ──────────────────────────────────────────────────────────
