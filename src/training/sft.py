@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 import torch
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
@@ -38,26 +40,32 @@ def train_sft(
     epochs: int = 2,
     lr: float = 2e-4,
     lora_rank: int = 64,
+    alpha: Optional[int] = None,
     use_4bit: bool = True,
     style_vec_dir: Optional[str] = "data/style_vectors",
     phonetic_loss_weight: float = 0.1,
+    viral_conditioning: Optional["np.ndarray"] = None,  # 32-dim viral DNA vector
 ):
     accelerator = Accelerator(gradient_accumulation_steps=grad_accum_steps)
 
+    lora_alpha = alpha if alpha is not None else lora_rank * 2
+
     if stage == 2:
         assert genre is not None, "Stage 2 requires --genre"
-        lora_rank = 16
-        epochs = 1
-        lr = 2e-4
         output_subdir = f"{output_dir}/genre_{genre}"
     else:
         output_subdir = f"{output_dir}/stage1_general"
+
+    # Log viral conditioning if provided
+    if viral_conditioning is not None and np.linalg.norm(viral_conditioning) > 0:
+        print(f"  Viral DNA conditioning: norm={np.linalg.norm(viral_conditioning):.3f}, "
+              f"top dims={viral_conditioning[:4].round(3)}")
 
     Path(output_subdir).mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     base, tokenizer = load_base_model(base_model, use_4bit=use_4bit and device == "cuda")
-    base = apply_lora(base, rank=lora_rank)
+    base = apply_lora(base, rank=lora_rank, alpha=lora_alpha)
     base.gradient_checkpointing_enable()
     model = LyricsModel(base, d_model=base.config.hidden_size)
 
@@ -88,11 +96,24 @@ def train_sft(
 
         for step, batch in enumerate(pbar):
             with accelerator.accumulate(model):
+                # Inject viral DNA: add as a bias to the style vector
+                style_vec = batch.get("style_vec")
+                if viral_conditioning is not None and style_vec is not None:
+                    viral_t = torch.tensor(viral_conditioning, dtype=style_vec.dtype, device=style_vec.device)
+                    # Pad/trim viral vector to match style vec dim
+                    sv_dim = style_vec.shape[-1]
+                    v_dim  = viral_t.shape[0]
+                    if v_dim < sv_dim:
+                        viral_t = torch.nn.functional.pad(viral_t, (0, sv_dim - v_dim))
+                    else:
+                        viral_t = viral_t[:sv_dim]
+                    style_vec = style_vec + 0.1 * viral_t.unsqueeze(0)
+
                 out = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     phoneme_ids=batch.get("phoneme_ids"),
-                    style_vec=batch.get("style_vec"),
+                    style_vec=style_vec,
                     labels=batch["labels"],
                 )
 
