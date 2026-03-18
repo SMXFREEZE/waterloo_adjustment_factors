@@ -3,12 +3,26 @@ Inference engine: constrained beam search for god-tier lyrics.
 
 Per-line generation flow:
   1. Build context: [genre token + LoRA] + [style prefix] + [section/arc tokens] + [accepted lines]
-  2. Generate beam_size=8 candidate lines
-  3. Post-score each candidate:
-     - phonetic constraint satisfaction (end-rhyme match)
-     - syllable count match (hard filter)
-     - novelty vs existing song lines
-     - emotional valence fit to arc target
+  2. Generate beam_size=8 candidate lines (DIVERGENT phase — high temperature, unconstrained)
+     Mirrors: MPFC-active creative generation phase in professional rappers [PMC3498928]
+  3. Post-score each candidate (CONVERGENT phase — full constraint battery):
+     ORIGINAL:
+       - phonetic constraint: end-rhyme match
+       - syllable count: hard filter ±3
+       - novelty: lexical overlap with accepted lines
+       - valence fit: emotional arc target
+     COGNITIVE ENGINE (emotional_geometry + phonosemantic + dopamine_arc):
+       - 8D emotional trajectory fit
+       - phonosemantic texture alignment (sound matches mood)
+       - goosebump predictor (tension × emotional jump × hook DNA)
+     RESEARCH-BACKED (research_scoring — 7 signals from peer-reviewed findings):
+       - polysyllabic rhyme depth (biggest quality predictor, arXiv:2505.00035)
+       - internal rhyme density (doubled in top artists since 2000)
+       - quadratic complexity calibrator (optimal ~65th percentile)
+       - 8-bar temporal arc weighting (final 2 bars = resolution priority)
+       - introspection/confessional bonus (surged 246% in modern hip-hop)
+       - vocabulary novelty (recency-weighted TTR)
+       - rhythmic stress alignment (motor-rhythm coupling, PMC3498928)
   4. Emit top-1 (auto) or top-3 (co-write mode)
 """
 
@@ -31,6 +45,7 @@ from src.model.phonosemantic import texture_alignment_score
 from src.model.dopamine_arc import (
     goosebump_potential, hook_dna_score, TensionCurve, analyze_song_dopamine,
 )
+from src.model.research_scoring import research_score
 
 
 # ── Syllable counter (deterministic, no LLM) ─────────────────────────────────
@@ -108,14 +123,22 @@ class SongMemory:
 @dataclass
 class CandidateScore:
     text:               str
-    phonetic_score:     float   # 0-1  rhyme match
+    phonetic_score:     float   # 0-1  end-rhyme match
     syllable_ok:        bool    # within ±3 syllables of target
-    novelty_score:      float   # 0-1  not repetitive
-    valence_fit:        float   # 0-1  emotional arc fit (simple)
-    trajectory_fit:     float   # 0-1  8D emotional geometry fit    ← NEW
-    texture_alignment:  float   # 0-1  phonosemantic texture match  ← NEW
-    goosebump:          float   # 0-1  predicted dopamine potential  ← NEW
-    hook_dna:           float   # 0-1  universal hook pattern score  ← NEW
+    novelty_score:      float   # 0-1  lexical novelty
+    valence_fit:        float   # 0-1  simple emotional fit
+    # Cognitive engine
+    trajectory_fit:     float   # 0-1  8D emotional geometry
+    texture_alignment:  float   # 0-1  phonosemantic
+    goosebump:          float   # 0-1  dopamine potential
+    hook_dna:           float   # 0-1  hook pattern strength
+    # Research-backed
+    polysyllabic_rhyme: float   # 0-1  rhyme depth (arXiv:2505.00035)
+    internal_rhyme:     float   # 0-1  within-line rhyme density
+    complexity:         float   # 0-1  quadratic complexity target
+    temporal_arc:       float   # 0-1  8-bar position alignment (PMC3498928)
+    introspection:      float   # 0-1  confessional content signal
+    stress_alignment:   float   # 0-1  motor-rhythm pattern
     total_score:        float
 
 
@@ -127,6 +150,7 @@ def score_candidate(
     section: str = "verse1",
     mood: str = "dark",
     tension_state: float = 0.3,
+    line_idx: int = 0,
 ) -> CandidateScore:
     ann = annotate_line(line)
 
@@ -185,15 +209,54 @@ def score_candidate(
     except Exception:
         hook = 0.0
 
-    # Weighted total — the Cognitive Music score
+    # 9-15. Research-backed scores (7 signals from peer-reviewed papers)
+    target_ep = memory.get_target_end_phoneme()
+    rhymes_target = bool(
+        ann.end_phoneme and target_ep and
+        __import__('src.data.rhyme_labeler', fromlist=['rhymes']).rhymes(ann.end_phoneme, target_ep)
+    ) if target_ep else True
+
+    try:
+        rs = research_score(
+            line=line,
+            line_idx=line_idx,
+            section=section,
+            recent_lines=memory.accepted_lines[-8:],
+            rhymes_with_target=rhymes_target,
+            tension_state=tension_state,
+            previous_line=prev_line,
+        )
+    except Exception:
+        rs = {
+            "polysyllabic_rhyme": 0.5, "internal_rhyme": 0.0,
+            "complexity": 0.5, "temporal_arc": 0.5, "introspection": 0.0,
+            "vocab_novelty": 0.5, "stress_alignment": 0.5,
+        }
+
+    # ── FINAL WEIGHTED SCORE ──────────────────────────────────────────────────
+    # Three-layer scoring:
+    #   Layer 1 (Original)  — ensures basic quality: rhyme, syllables, novelty
+    #   Layer 2 (Cognitive) — emotional geometry, texture, dopamine prediction
+    #   Layer 3 (Research)  — polysyllabic rhyme, internal rhyme, complexity arc
     total = (
-        0.22 * phonetic_score
-        + 0.15 * (1.0 if syllable_ok else 0.0)
-        + 0.13 * novelty_score
-        + 0.18 * traj_fit       # emotional geometry
-        + 0.12 * tex_align      # phonosemantic
-        + 0.12 * gbump          # goosebump predictor
-        + 0.08 * hook           # hook DNA
+        # Layer 1: basic quality (30%)
+        0.12 * phonetic_score
+        + 0.08 * (1.0 if syllable_ok else 0.0)
+        + 0.05 * novelty_score
+        + 0.05 * valence_fit
+        # Layer 2: cognitive music engine (35%)
+        + 0.12 * traj_fit
+        + 0.08 * tex_align
+        + 0.10 * gbump
+        + 0.05 * hook
+        # Layer 3: research-backed (35%)
+        + 0.10 * rs["polysyllabic_rhyme"]
+        + 0.07 * rs["internal_rhyme"]
+        + 0.05 * rs["complexity"]
+        + 0.05 * rs["temporal_arc"]
+        + 0.04 * rs["introspection"]
+        + 0.03 * rs["vocab_novelty"]
+        + 0.01 * rs["stress_alignment"]
     )
 
     return CandidateScore(
@@ -206,7 +269,13 @@ def score_candidate(
         texture_alignment=tex_align,
         goosebump=gbump,
         hook_dna=hook,
-        total_score=total,
+        polysyllabic_rhyme=rs["polysyllabic_rhyme"],
+        internal_rhyme=rs["internal_rhyme"],
+        complexity=rs["complexity"],
+        temporal_arc=rs["temporal_arc"],
+        introspection=rs["introspection"],
+        stress_alignment=rs["stress_alignment"],
+        total_score=float(total),
     )
 
 
@@ -234,7 +303,20 @@ class LyricsEngine:
         temperature: float = 0.85,
         top_p: float = 0.9,
     ) -> list[str]:
-        """Generate beam_size candidate lines from the prompt."""
+        """
+        TWO-PHASE GENERATION — mirrors the MPFC/DLPFC cognitive process
+        from freestyle rap neuroscience research [PMC3498928]:
+
+        Phase 1 (DIVERGENT): high temperature, unconstrained, maximum creativity
+          → Mirrors MPFC-active state: broad semantic associations, emotional access
+          → Generates beam_size × 1.5 candidates with high novelty
+
+        Phase 2 (CONVERGENT): lower temperature, top-k filtering
+          → Mirrors DLPFC re-engagement: applies rhythmic/narrative structure
+          → Generates beam_size × 0.5 candidates with tighter pattern adherence
+
+        Combined pool is passed to the scorer (which acts as the evaluative phase).
+        """
         enc = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -243,30 +325,66 @@ class LyricsEngine:
         )
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
-
-        outputs = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            num_return_sequences=self.beam_size,
-            pad_token_id=self.tokenizer.eos_token_id,
-            eos_token_id=self.tokenizer.encode("\n")[0] if "\n" in self.tokenizer.get_vocab() else None,
-        )
+        eos = self.tokenizer.encode("\n")[0] if "\n" in self.tokenizer.get_vocab() else None
 
         candidates = []
-        prompt_len = input_ids.shape[1]
-        for out in outputs:
-            new_tokens = out[prompt_len:]
-            text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            # Take only the first line
-            line = text.strip().split("\n")[0].strip()
-            if line:
-                candidates.append(line)
 
-        return candidates if candidates else ["[no candidate generated]"]
+        # ── Phase 1: Divergent (MPFC mode) ────────────────────────────────
+        divergent_n = max(1, int(self.beam_size * 1.5))
+        try:
+            out_divergent = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=min(temperature * 1.3, 1.2),  # hotter = more creative
+                top_p=0.98,                                # nearly unconstrained
+                num_return_sequences=divergent_n,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=eos,
+            )
+            prompt_len = input_ids.shape[1]
+            for out in out_divergent:
+                text = self.tokenizer.decode(out[prompt_len:], skip_special_tokens=True)
+                line = text.strip().split("\n")[0].strip()
+                if line:
+                    candidates.append(line)
+        except Exception:
+            pass
+
+        # ── Phase 2: Convergent (DLPFC mode) ──────────────────────────────
+        convergent_n = max(1, self.beam_size // 2)
+        try:
+            out_convergent = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=max(temperature * 0.7, 0.5),  # cooler = more structured
+                top_k=50,                                   # tighter vocabulary
+                top_p=0.85,
+                num_return_sequences=convergent_n,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=eos,
+            )
+            prompt_len = input_ids.shape[1]
+            for out in out_convergent:
+                text = self.tokenizer.decode(out[prompt_len:], skip_special_tokens=True)
+                line = text.strip().split("\n")[0].strip()
+                if line:
+                    candidates.append(line)
+        except Exception:
+            pass
+
+        # Deduplicate preserving order
+        seen = set()
+        unique = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+
+        return unique if unique else ["[no candidate generated]"]
 
     def generate_line(
         self,
@@ -283,6 +401,7 @@ class LyricsEngine:
         prompt = memory.build_prompt()
         candidates = self.generate_candidates(prompt)
 
+        line_idx = len(memory.accepted_lines)
         scored = [
             score_candidate(
                 c, memory,
@@ -290,6 +409,7 @@ class LyricsEngine:
                 section=section,
                 mood=memory.mood,
                 tension_state=memory.tension_curve.current,
+                line_idx=line_idx,
             )
             for c in candidates
         ]
