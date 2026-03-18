@@ -153,7 +153,7 @@ def extract_style_features(songs: list[str]) -> np.ndarray:
 def build_style_vectors(
     jsonl_path: str,
     out_dir: str = "data/style_vectors",
-    min_songs: int = 5,
+    min_songs: int = 1,
 ) -> dict[str, StyleVector]:
     """
     Read artist songs from a JSONL file, compute style vectors,
