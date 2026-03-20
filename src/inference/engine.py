@@ -68,6 +68,7 @@ class SongMemory:
     used_end_phonemes: list[str] = field(default_factory=list)  # to avoid repetition
     tension_curve: TensionCurve = field(default_factory=TensionCurve)
     sections_lines: dict = field(default_factory=dict)  # track lines per section
+    use_ccl_format: bool = True             # Use Cortical Creative Loop format
 
     def add_line(self, line: str, section: str = "verse1"):
         self.accepted_lines.append(line)
@@ -107,7 +108,24 @@ class SongMemory:
         return None
 
     def build_prompt(self) -> str:
-        """Build the full generation prompt from memory."""
+        """Build the full generation prompt from memory.
+
+        Uses CCL (Cortical Creative Loop) format if use_ccl_format is True,
+        which matches the training format:
+
+        [INST] Write {genre} lyrics for [{section}] ({arc}): [/INST]
+        [PERCEIVE] [CONTEXT] section={section} position={pos} [EMO_STATE] valence={v} arousal={a} [RHYTHM_STATE] flow={flow}
+        [INTENT] {arc} [TARGET_EMO] {mood} [TARGET_RHYTHM] {flow} [TARGET_NOVELTY] varied
+        [PREDICT]
+        {lyrics context}
+        """
+        if self.use_ccl_format:
+            return self._build_ccl_prompt()
+        else:
+            return self._build_simple_prompt()
+
+    def _build_simple_prompt(self) -> str:
+        """Build simple (legacy) format prompt."""
         parts: list[str] = []
         parts.append(f"[GENRE_START] {self.genre} [GENRE_END]")
         if self.sections:
@@ -115,6 +133,67 @@ class SongMemory:
             parts.append(f"[{section}] {arc}")
         for line in self.accepted_lines[-20:]:  # last 20 lines as context
             parts.append(line)
+        return "\n".join(parts) + "\n"
+
+    def _build_ccl_prompt(self) -> str:
+        """Build CCL (Cortical Creative Loop) format prompt - matches training."""
+        parts: list[str] = []
+
+        # Get current section info
+        if self.sections:
+            arc, section = self.sections[-1]
+        else:
+            arc, section = "[SETUP]", "VERSE"
+
+        # Map mood to valence/arousal labels
+        mood_map = {
+            "dark": ("dark", "energetic"),
+            "hype": ("uplifting", "intense"),
+            "romantic": ("uplifting", "calm"),
+            "chill": ("neutral", "calm"),
+            "sad": ("melancholic", "calm"),
+            "epic": ("euphoric", "intense"),
+        }
+        valence_label, arousal_label = mood_map.get(self.mood, ("neutral", "moderate"))
+
+        # Rhythm label from target syllables
+        if self.target_syllables >= 12:
+            rhythm_label = "dense"
+        elif self.target_syllables >= 8:
+            rhythm_label = "standard"
+        else:
+            rhythm_label = "sparse"
+
+        # Count sections and position
+        total_sections = max(len(self.sections), 1)
+        position = len(self.sections)
+
+        # Build instruction
+        instruction = f"[INST] Write {self.genre} lyrics for [{section}] ({arc}): [/INST]"
+        parts.append(instruction)
+
+        # PERCEIVE phase
+        perceive = (
+            f"[PERCEIVE] [CONTEXT] section={section} position={position}/{total_sections} "
+            f"[EMO_STATE] valence={valence_label} arousal={arousal_label} "
+            f"[RHYTHM_STATE] flow={rhythm_label}"
+        )
+        parts.append(perceive)
+
+        # INTENT phase
+        intent = (
+            f"[INTENT] {arc} [TARGET_EMO] {valence_label} "
+            f"[TARGET_RHYTHM] {rhythm_label} [TARGET_NOVELTY] varied"
+        )
+        parts.append(intent)
+
+        # PREDICT marker
+        parts.append("[PREDICT]")
+
+        # Recent context lines (last 12 for longer context)
+        for line in self.accepted_lines[-12:]:
+            parts.append(line)
+
         return "\n".join(parts) + "\n"
 
 
@@ -455,6 +534,106 @@ class LyricsEngine:
                 generated_lines.append(best.text)
 
         return generated_lines
+
+    def generate_full_song(
+        self,
+        memory: SongMemory,
+        structure: Optional[list[tuple[str, str, int]]] = None,
+        auto_accept: bool = True,
+    ) -> dict[str, list[str]]:
+        """
+        Generate a complete song with multiple sections.
+
+        Parameters
+        ----------
+        memory : SongMemory
+            Song context (genre, mood, rhyme scheme, etc.)
+        structure : list of (section_name, arc_token, num_lines)
+            Song structure. If None, uses default full-song structure.
+            Example: [("VERSE", "[SETUP]", 8), ("CHORUS", "[RELEASE]", 8), ...]
+        auto_accept : bool
+            If True, automatically accept best candidate for each line.
+
+        Returns
+        -------
+        dict mapping section names to lists of generated lines.
+
+        Example default structure (typical commercial song ~3-4 minutes):
+            - Intro verse (4 lines)
+            - Verse 1 (12 lines)
+            - Pre-chorus (4 lines)
+            - Chorus (8 lines)
+            - Verse 2 (12 lines)
+            - Pre-chorus (4 lines)
+            - Chorus (8 lines)
+            - Bridge (6 lines)
+            - Final Chorus (8 lines)
+            - Outro (4 lines)
+
+        Total: ~70 lines = full-length commercial song
+        """
+        if structure is None:
+            # Default full-song structure (~70 lines)
+            structure = [
+                ("INTRO",      "[SETUP]",   4),
+                ("VERSE",      "[SETUP]",   12),
+                ("PRECHORUS",  "[BUILD]",   4),
+                ("CHORUS",     "[RELEASE]", 8),
+                ("VERSE",      "[BUILD]",   12),
+                ("PRECHORUS",  "[BUILD]",   4),
+                ("CHORUS",     "[RELEASE]", 8),
+                ("BRIDGE",     "[REFRAME]", 6),
+                ("CHORUS",     "[PEAK]",    8),
+                ("OUTRO",      "[OUTRO]",   4),
+            ]
+
+        song_lyrics: dict[str, list[str]] = {}
+        section_counts: dict[str, int] = {}
+
+        for section_name, arc_token, num_lines in structure:
+            # Track multiple occurrences of same section type (e.g., VERSE → verse1, verse2)
+            if section_name not in section_counts:
+                section_counts[section_name] = 0
+            section_counts[section_name] += 1
+
+            section_key = f"{section_name.lower()}{section_counts[section_name]}"
+
+            print(f"  Generating [{section_name}] {arc_token} ({num_lines} lines)...")
+
+            lines = self.generate_verse(
+                memory,
+                num_lines=num_lines,
+                section=section_name,
+                arc_token=arc_token,
+                auto_accept=auto_accept,
+            )
+
+            song_lyrics[section_key] = lines
+
+        return song_lyrics
+
+    def generate_song_text(
+        self,
+        memory: SongMemory,
+        structure: Optional[list[tuple[str, str, int]]] = None,
+    ) -> str:
+        """
+        Generate a complete song and return as formatted text.
+
+        Returns
+        -------
+        str : Full song lyrics with section headers.
+        """
+        song_dict = self.generate_full_song(memory, structure)
+
+        output_lines = []
+        for section_key, lines in song_dict.items():
+            # Convert section_key (e.g., "verse1") to header (e.g., "[VERSE]")
+            section_name = "".join(c for c in section_key if not c.isdigit()).upper()
+            output_lines.append(f"\n[{section_name}]")
+            output_lines.extend(lines)
+
+        return "\n".join(output_lines).strip()
 
     def analyze_song(self, memory: SongMemory) -> dict:
         """
